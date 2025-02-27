@@ -1,0 +1,790 @@
+#pragma once
+#include "kernel_operator.h"
+#include "kernel_tpipe_impl.h"
+#include "kernel_tensor_impl.h"
+#include "kernel_type.h"
+#include "kernel_operator_intf.h"
+#include "inner_interface/inner_kernel_operator_intf.h"
+// #include "acl/acl.h"
+// #include <tiling/platform/platform_ascendc.h>
+// #include <register/tilingdata_base.h>
+
+// #include <iostream>
+#include <stdio.h>
+#include "utils.h"
+
+
+
+constexpr int32_t TOTAL_LENGTH = 8 * 2048;                            // total length of data
+constexpr int32_t USE_CORE_NUM = 8;                                   // num of core used
+constexpr int32_t BLOCK_LENGTH = TOTAL_LENGTH / USE_CORE_NUM;         // length computed of each core
+constexpr int32_t TILE_NUM = 8;                                       // split data into 8 tiles for each core
+constexpr int32_t BUFFER_NUM = 2;                                     // tensor num for each queue
+constexpr int32_t TILE_LENGTH = BLOCK_LENGTH / TILE_NUM / BUFFER_NUM; // separate to 2 parts, due to double buffer
+
+class KernelAdd {
+public:
+    __aicore__ inline KernelAdd(){};
+    // 初始化函数，完成内存初始化相关操作
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y, GM_ADDR z);
+    // 核心处理函数，实现算子逻辑，调用私有成员函数CopyIn、Compute、CopyOut完成矢量算子的三级流水操作
+    __aicore__ inline void Process();
+
+private:
+    // 搬入函数，完成CopyIn阶段的处理，被核心Process函数调用
+    __aicore__ inline void CopyIn(int32_t progress);
+    // 计算函数，完成Compute阶段的处理，被核心Process函数调用
+  ate:
+    AscendC::TPipe pipe;  //Pipe内存管理对象
+    AscendC::TQue<AscendC::QuePosition::VECIN, BUFFER_NUM> inQueueX, inQueueY;  //输入数据Queue队列管理对象，QuePosition为VECIN
+    AscendC::TQue<AscendC::QuePosition::VECOUT, BUFFER_NUM> outQueueZ;  //输出数据Queue队列管理对象，QuePosition为VECOUT
+    AscendC::GlobalTensor<half> xGm;  //管理输入输出Global Memory内存地址的对象，其中xGm, yGm为输入，zGm为输出
+    AscendC::GlobalTensor<half> yGm;
+    AscendC::GlobalTensor<half> zGm;
+};
+
+
+
+template <typename scalar_t>
+struct acc_type;
+
+template<>
+struct acc_type<bfloat16_t> {
+    using type = float;
+};
+
+template <>
+struct acc_type<half> {
+    using type = half;
+};
+
+template <>
+struct acc_type<float> {
+    using type = float;
+};
+
+template <typename scalar_t, bool IS_NEOX>
+class KernelRope {
+    static int constexpr BLK_SIZE = 32;
+    static int constexpr STRIDE_SIZE = 32 * 8;
+    static int constexpr ROPE_TILING = 128;
+    static int constexpr LOAD_SIZE = 1024 * 64;
+    using acc_t = typename acc_type<scalar_t>::type;
+    using LocT = AscendC::LocalTensor<scalar_t>;
+    using LocAcc = AscendC::LocalTensor<acc_t>;
+    public:
+        __aicore__ inline KernelRope() {}
+
+        __aicore__ inline void Init(
+            __gm__ int64_t* positions,
+            __gm__ scalar_t* query_dst,
+            __gm__ scalar_t* key_dst,
+            __gm__ scalar_t* query,
+            __gm__ scalar_t* key,
+            __gm__ scalar_t* cos_sin_cache,
+            const int rot_dim,
+            const int64_t dst_query_stride,
+            const int64_t dst_key_stride,
+            const int64_t query_stride,
+            const int64_t key_stride,
+            const int num_heads,
+            const int num_kv_heads,
+            const int head_size,
+            AscendC::TPipe* pipe
+        ) {
+            pipe_ = pipe;
+            rot_dim_ = rot_dim;
+            query_stride_ = query_stride;
+            key_stride_ = key_stride;
+            num_heads_ = num_heads;
+            num_kv_heads_ = num_kv_heads;
+            head_size_ = head_size;
+            // int64_t pos = positions[AscendC::GetBlockIdx()];
+            // embed_dim_ = rot_dim / 2;
+            // cos_sin_cache = cos_sin_cache + pos * rot_dim_;
+            // cos_.SetGlobalBuffer(cos_sin_cache, embed_dim_);
+            // sin_.SetGlobalBuffer(cos_sin_cache + embed_dim_, embed_dim_);
+            // query_.SetGlobalBuffer(query + query_stride * AscendC::GetBlockIdx(), head_size * num_heads_);
+            // key_.SetGlobalBuffer(key + key_stride * AscendC::GetBlockIdx(), head_size * num_kv_heads_);
+            // query_dst_.SetGlobalBuffer(query_dst + dst_query_stride * AscendC::GetBlockIdx(), head_size * num_heads_);
+            // key_dst_.SetGlobalBuffer(key_dst + dst_key_stride * AscendC::GetBlockIdx(), head_size * num_kv_heads_);
+            pipe_->InitBuffer(in_que_, 1, LOAD_SIZE);
+            pipe_->InitBuffer(in_que_sin_cos_, 1, rot_dim_ * sizeof(scalar_t));
+            pipe_->InitBuffer(out_que_, 1, LOAD_SIZE);
+            // need to consider upcast the bf16 to fp32, so we might need 4 buffer just in case
+            // 2 temperary buffer, 2 input buffer, 1 cos buffer, 1 sin buffer
+            pipe_->InitBuffer(calc_buf_, 6 * embed_dim_ * sizeof(acc_t));
+            if constexpr (IS_NEOX) {
+                // note: We allocate two mask buffer as its max valid mask size, namely 256bit * 4 for NEOX scenario.
+                pipe_->InitBuffer(interleave_mask_, embed_dim_ * sizeof(uint32_t) * 6);
+            }
+        }
+    __aicore__ inline void Update(
+            __gm__ int64_t* positions,
+            __gm__ scalar_t* query_dst,
+            __gm__ scalar_t* key_dst,
+            __gm__ scalar_t* query,
+            __gm__ scalar_t* key,
+            __gm__ scalar_t* cos_sin_cache,
+            const int rot_dim,
+            const int64_t dst_query_stride,
+            const int64_t dst_key_stride,
+            const int64_t query_stride,
+            const int64_t key_stride,
+            const int num_heads,
+            const int num_kv_heads,
+            const int head_size,
+            const int64_t idx) {
+            int64_t pos = positions[idx];
+            embed_dim_ = rot_dim / 2;
+            cos_sin_cache = cos_sin_cache + pos * rot_dim_;
+            cos_.SetGlobalBuffer(cos_sin_cache, embed_dim_);
+            sin_.SetGlobalBuffer(cos_sin_cache + embed_dim_, embed_dim_);
+            query_.SetGlobalBuffer(query + query_stride * idx, head_size * num_heads_);
+            key_.SetGlobalBuffer(key + key_stride * idx, head_size * num_kv_heads_);
+            query_dst_.SetGlobalBuffer(query_dst + dst_query_stride * idx, head_size * num_heads_);
+            key_dst_.SetGlobalBuffer(key_dst + dst_key_stride * idx, head_size * num_kv_heads_);
+    }
+
+    __aicore__ inline void Compute() {
+        LocT local_sin_cos = in_que_sin_cos_.AllocTensor<scalar_t>();
+        LocT local_cos = local_sin_cos;
+        LocT local_sin = local_sin_cos[embed_dim_];
+        // #if 0
+        // AscendC::LocalTensor<scalar_t> local_in_2nd = in_que_2nd_.AllocTensor<scalar_t>();
+        AscendC::DataCopy(local_cos, cos_[0], embed_dim_);
+        AscendC::DataCopy(local_sin, sin_[0], embed_dim_);
+        // #if 0
+        in_que_sin_cos_.EnQue(local_sin_cos);
+        LocT local_sin_cos_deque = in_que_sin_cos_.DeQue<scalar_t>();
+        local_cos = local_sin_cos_deque;
+        local_sin = local_sin_cos_deque[embed_dim_];
+        // We define the interleave mask 1, 2, 3 for shuffle and deshuffle operation in non-neox scenario, mask1 and mask2 are build for
+        // shuffle the x and y into two consecutive buffer, and mask3 is build for de-shuffle the scattered data back to the data that 
+        // can rewrite back to the global memory.
+        AscendC::LocalTensor<int32_t> interleave_mask1, interleave_mask2, interleave_mask3, tmp_mask;
+        AscendC::LocalTensor<uint32_t> umask1, umask2, umask3;
+        uint8_t loop_cnt_mask = (embed_dim_ + STRIDE_SIZE - 1) / STRIDE_SIZE;
+        int32_t start_val = 0;
+
+        if constexpr (!IS_NEOX) {
+            interleave_mask1 = interleave_mask_.Get<int32_t>(embed_dim_ * 6);
+            interleave_mask2 = interleave_mask1[embed_dim_];
+            interleave_mask3 = interleave_mask1[rot_dim_];
+            tmp_mask = interleave_mask1[2 * rot_dim_];
+            int32_t mul_div_val = 2;
+            int32_t add_val = 1;
+            CreateVecIndex(interleave_mask1, start_val, embed_dim_);
+            CreateVecIndex(interleave_mask3, start_val, rot_dim_);
+            Muls(interleave_mask1, interleave_mask1, mul_div_val, embed_dim_);
+            Adds(interleave_mask2, interleave_mask1, add_val, embed_dim_);
+            // Div instruction dose not have scalar version, use tmp mask for this place.
+            Duplicate(tmp_mask, mul_div_val, rot_dim_);
+            AscendC::LocalTensor<float> tmp_interleave_mask3, tmp_tmp_mask;
+            Cast(tmp_interleave_mask3, interleave_mask3, AscendC::RoundMode::CAST_ROUND, rot_dim_);
+            Cast(tmp_tmp_mask, tmp_mask, AscendC::RoundMode::CAST_ROUND, rot_dim_);
+            Div(tmp_interleave_mask3, tmp_interleave_mask3, tmp_tmp_mask, rot_dim_);
+            Cast(interleave_mask3, tmp_interleave_mask3, AscendC::RoundMode::CAST_FLOOR, rot_dim_);
+
+            uint64_t mask[2] = {uint64_t(0x5555555555555555ULL), uint64_t(0x5555555555555555ULL)};
+            Adds(interleave_mask3, interleave_mask3, embed_dim_, mask, loop_cnt_mask, {});
+            umask1 = interleave_mask1.ReinterpretCast<uint32_t>();
+            umask2 = interleave_mask2.ReinterpretCast<uint32_t>();
+            umask3 = interleave_mask3.ReinterpretCast<uint32_t>();
+        }
+        LocAcc local_buffer, local_buffer1, local_buffer2, local_buffer3, cos_buffer, sin_buffer;
+        local_buffer = calc_buf_.Get<acc_t>();
+        local_buffer1 = local_buffer[embed_dim_];
+        local_buffer2 = local_buffer[embed_dim_ * 2];
+        local_buffer3 = local_buffer[embed_dim_ * 3];
+        cos_buffer = local_buffer[embed_dim_ * 4];
+        sin_buffer = local_buffer[embed_dim_ * 5];
+
+        if constexpr (!std::is_same<scalar_t, acc_t>::value) {
+            Cast(cos_buffer, local_sin_cos_deque, AscendC::RoundMode::CAST_NONE, 2 * embed_dim_);
+        }
+
+        constexpr const int load_size = LOAD_SIZE / sizeof(scalar_t);
+        int64_t head_num_per_load = load_size / head_size_;
+        int64_t loop_cnt = num_heads_ / head_num_per_load;
+        int64_t tail_heads = num_heads_ - loop_cnt * head_num_per_load;
+        int64_t load_stride = head_num_per_load * head_size_;
+        int64_t loop_cnt_kv = num_kv_heads_ / head_num_per_load;
+        int64_t tail_heads_kv = num_kv_heads_ - loop_cnt_kv * head_num_per_load;
+        // AscendC::printf("loop cnt: %d, tail heads: %d, loop cnt kv: %d, tail heads kv: %d, head_size: %d",loop_cnt, tail_heads, loop_cnt_kv, tail_heads_kv, head_size_);
+
+
+
+        // int64_t hidden_size = head_size_ * num_heads_
+        // int main_loop_cnt = hidden_size / LOAD_SIZE;
+        // int tail_cnt = hidden_size - main_loop_cnt * LOAD_SIZE;
+        // int64_t hidden_size_kv = head_size_ * num_kv_heads_;
+        // int main_loop_cnt_kv = hidden_size_kv / LOAD_SIZE;
+        // int tail_cnt_kv = hidden_size_kv - main_loop_cnt_kv * hidden_size_kv;
+        // process main loop
+        for (int loop_num = 0; loop_num < loop_cnt; ++loop_num) {
+            LocT local_in = in_que_.AllocTensor<scalar_t>();
+            LocT local_out = out_que_.AllocTensor<scalar_t>();
+            int repeat_cnt = (load_stride + 127) / 128;
+            AscendC::DataCopy(local_in, query_[loop_num * load_stride], load_stride);
+            in_que_.EnQue(local_in);
+
+            LocT local_in_deque = in_que_.DeQue<scalar_t>();
+            AscendC::Copy(local_out, local_in_deque, 128, repeat_cnt, {1, 1, 8, 8});
+            for (int i = 0; i < head_num_per_load; ++i) {
+                
+                LocT local_in_deque_slice = local_in_deque[i * head_size_];
+                LocT local_out_slice = local_out[i * head_size_];
+
+                LocT local_out_slice_x = local_out_slice;
+                LocT local_out_slice_y = local_out_slice[embed_dim_];
+
+// #if 0
+
+                LocT slice_x = local_in_deque_slice;
+                LocT slice_y = local_in_deque_slice[embed_dim_];
+                // bf16 path
+                if constexpr (!std::is_same<acc_t, scalar_t>::value) {
+                    Cast(local_buffer2, slice_x, AscendC::RoundMode::CAST_NONE, 2 * embed_dim_);
+                    Mul(local_buffer, local_buffer2, cos_buffer, embed_dim_);
+                    Mul(local_buffer1, local_buffer3, sin_buffer, embed_dim_);
+                    Sub(local_buffer, local_buffer, local_buffer1, embed_dim_);
+                    Cast(local_out_slice_x, local_buffer, AscendC::RoundMode::CAST_TRUNC, embed_dim_);
+                    Mul(local_buffer, local_buffer2, sin_buffer, embed_dim_);
+                    Mul(local_buffer1, local_buffer3, cos_buffer, embed_dim_);
+                    Add(local_buffer, local_buffer, local_buffer1, embed_dim_);
+                    Cast(local_out_slice_y, local_buffer, AscendC::RoundMode::CAST_TRUNC, embed_dim_);
+                } else {
+                    Mul(local_buffer, slice_x, local_cos, embed_dim_);
+                    Mul(local_buffer1, slice_y, local_sin, embed_dim_);
+                    Sub(local_out_slice_x, local_buffer, local_buffer1, embed_dim_);
+                    Mul(local_buffer, slice_x, local_sin, embed_dim_);
+                    Mul(local_buffer1, slice_y, local_cos, embed_dim_);
+                    Add(local_out_slice_y, local_buffer, local_buffer1, embed_dim_);
+                }
+// #endif 
+            }
+            out_que_.EnQue(local_out);
+            local_out = out_que_.DeQue<scalar_t>();
+            AscendC::DataCopy(query_dst_[loop_num * load_stride], local_out, load_stride);
+            out_que_.FreeTensor(local_out);
+            in_que_.FreeTensor(local_in);
+        }
+        {
+            LocT local_in = in_que_.AllocTensor<scalar_t>();
+            LocT local_out = out_que_.AllocTensor<scalar_t>();
+            int repeat_cnt = (tail_heads * head_size_ * sizeof(scalar_t) + 255) / 256;
+            AscendC::DataCopy(local_in, query_[loop_cnt * load_stride], tail_heads * head_size_);
+
+            in_que_.EnQue(local_in);
+            LocT local_in_deque = in_que_.DeQue<scalar_t>();
+            AscendC::Copy(local_out, local_in_deque, 256 / sizeof(scalar_t), repeat_cnt, {1, 1, 8, 8});
+
+            for (int i = 0; i < tail_heads; ++i) {
+                LocT local_in_deque_slice = local_in_deque[i * head_size_];
+                LocT local_out_slice = local_out[i * head_size_];
+
+                LocT local_out_slice_x = local_out_slice;
+                LocT local_out_slice_y = local_out_slice[embed_dim_];
+
+                LocT slice_x = local_in_deque_slice;
+                LocT slice_y = local_in_deque_slice[embed_dim_];
+                if constexpr (!std::is_same<acc_t, scalar_t>::value) {
+                    Cast(local_buffer2, slice_x, AscendC::RoundMode::CAST_NONE, 2 * embed_dim_);
+                    Mul(local_buffer, local_buffer2, cos_buffer, embed_dim_);
+                    Mul(local_buffer1, local_buffer3, sin_buffer, embed_dim_);
+                    Sub(local_buffer, local_buffer, local_buffer1, embed_dim_);
+                    Cast(local_out_slice_x, local_buffer, AscendC::RoundMode::CAST_TRUNC, embed_dim_);
+                    Mul(local_buffer, local_buffer2, sin_buffer, embed_dim_);
+                    Mul(local_buffer1, local_buffer3, cos_buffer, embed_dim_);
+                    Add(local_buffer, local_buffer, local_buffer1, embed_dim_);
+                    Cast(local_out_slice_y, local_buffer, AscendC::RoundMode::CAST_TRUNC, embed_dim_);
+                } else {
+                    Mul(local_buffer, slice_x, local_cos, embed_dim_);
+                    Mul(local_buffer1, slice_y, local_sin, embed_dim_);
+                    Sub(local_out_slice_x, local_buffer, local_buffer1, embed_dim_);
+                    Mul(local_buffer, slice_x, local_sin, embed_dim_);
+                    Mul(local_buffer1, slice_y, local_cos, embed_dim_);
+                    Add(local_out_slice_y, local_buffer, local_buffer1, embed_dim_);
+                }
+
+#if 0
+                Mul(local_buffer, slice_x, local_cos, embed_dim_);
+                Mul(local_buffer1, slice_y, local_sin, embed_dim_);
+                Sub(local_out_slice_x, local_buffer, local_buffer1, embed_dim_);
+// #if 0
+                Mul(local_buffer, slice_x, local_sin, embed_dim_);
+                Mul(local_buffer1, slice_y, local_cos, embed_dim_);
+                Add(local_out_slice_y, local_buffer, local_buffer1, embed_dim_);
+#endif 
+            }
+            // #endif 
+            out_que_.EnQue(local_out);
+            local_out = out_que_.DeQue<scalar_t>();
+            AscendC::DataCopy(query_dst_[loop_cnt * load_stride], local_out, tail_heads * head_size_);
+            out_que_.FreeTensor(local_out);
+            in_que_.FreeTensor(local_in);
+        }
+
+        for (int loop_num = 0; loop_num < loop_cnt_kv; ++loop_num) {
+            LocT local_in = in_que_.AllocTensor<scalar_t>();
+            LocT local_out = out_que_.AllocTensor<scalar_t>();
+            int repeat_cnt = (load_stride + 127) / 128;
+            AscendC::DataCopy(local_in, key_[loop_num * load_stride], load_stride);
+            in_que_.EnQue(local_in);
+            LocT local_in_deque = in_que_.DeQue<scalar_t>();
+            AscendC::Copy(local_out, local_in_deque, 128, repeat_cnt, {1, 1, 8, 8});
+            for (int i = 0; i < head_num_per_load; ++i) {
+
+                LocT local_in_deque_slice = local_in_deque[i * head_size_];
+                LocT local_out_slice = local_out[i * head_size_];
+
+                LocT local_out_slice_x = local_out_slice;
+                LocT local_out_slice_y = local_out_slice[embed_dim_];
+
+                LocT slice_x = local_in_deque_slice;
+                LocT slice_y = local_in_deque_slice[embed_dim_];
+                if constexpr (!std::is_same<acc_t, scalar_t>::value) {
+                    Cast(local_buffer2, slice_x, AscendC::RoundMode::CAST_NONE, 2 * embed_dim_);
+                    Mul(local_buffer, local_buffer2, cos_buffer, embed_dim_);
+                    Mul(local_buffer1, local_buffer3, sin_buffer, embed_dim_);
+                    Sub(local_buffer, local_buffer, local_buffer1, embed_dim_);
+                    Cast(local_out_slice_x, local_buffer, AscendC::RoundMode::CAST_TRUNC, embed_dim_);
+                    Mul(local_buffer, local_buffer2, sin_buffer, embed_dim_);
+                    Mul(local_buffer1, local_buffer3, cos_buffer, embed_dim_);
+                    Add(local_buffer, local_buffer, local_buffer1, embed_dim_);
+                    Cast(local_out_slice_y, local_buffer, AscendC::RoundMode::CAST_TRUNC, embed_dim_);
+                } else {
+                    Mul(local_buffer, slice_x, local_cos, embed_dim_);
+                    Mul(local_buffer1, slice_y, local_sin, embed_dim_);
+                    Sub(local_out_slice_x, local_buffer, local_buffer1, embed_dim_);
+                    Mul(local_buffer, slice_x, local_sin, embed_dim_);
+                    Mul(local_buffer1, slice_y, local_cos, embed_dim_);
+                    Add(local_out_slice_y, local_buffer, local_buffer1, embed_dim_);
+                }
+#if 0
+                Mul(local_buffer, slice_x, local_cos, embed_dim_);
+                Mul(local_buffer1, slice_y, local_sin, embed_dim_);
+                Sub(local_out_slice_x, local_buffer, local_buffer1, embed_dim_);
+                Mul(local_buffer, slice_x, local_sin, embed_dim_);
+                Mul(local_buffer1, slice_y, local_cos, embed_dim_);
+                Add(local_out_slice_y, local_buffer, local_buffer1, embed_dim_);
+#endif
+            }
+            out_que_.EnQue(local_out);
+            local_out = out_que_.DeQue<scalar_t>();
+            AscendC::DataCopy(key_dst_[loop_num * load_stride], local_out, load_stride);
+            out_que_.FreeTensor(local_out);
+            in_que_.FreeTensor(local_in);
+        }
+        {
+            LocT local_in = in_que_.AllocTensor<scalar_t>();
+            LocT local_out = out_que_.AllocTensor<scalar_t>();
+            int repeat_cnt = (tail_heads_kv * head_size_ + 127) / 128;
+            AscendC::DataCopy(local_in, key_[loop_cnt_kv * head_num_per_load], tail_heads_kv * head_size_);
+            in_que_.EnQue(local_in);
+            LocT local_in_deque = in_que_.DeQue<scalar_t>();
+            AscendC::Copy(local_out, local_in_deque, 128, repeat_cnt, {1, 1, 8, 8});
+            for (int i = 0; i < tail_heads_kv; ++i) {
+                LocT local_in_deque_slice = local_in_deque[i * head_size_];
+                LocT local_out_slice = local_out[i * head_size_];
+
+                LocT local_out_slice_x = local_out_slice;
+                LocT local_out_slice_y = local_out_slice[embed_dim_];
+
+                LocT slice_x = local_in_deque_slice;
+                LocT slice_y = local_in_deque_slice[embed_dim_];
+                if constexpr (!std::is_same<acc_t, scalar_t>::value) {
+                    Cast(local_buffer2, slice_x, AscendC::RoundMode::CAST_NONE, 2 * embed_dim_);
+                    Mul(local_buffer, local_buffer2, cos_buffer, embed_dim_);
+                    Mul(local_buffer1, local_buffer3, sin_buffer, embed_dim_);
+                    Sub(local_buffer, local_buffer, local_buffer1, embed_dim_);
+                    Cast(local_out_slice_x, local_buffer, AscendC::RoundMode::CAST_TRUNC, embed_dim_);
+                    Mul(local_buffer, local_buffer2, sin_buffer, embed_dim_);
+                    Mul(local_buffer1, local_buffer3, cos_buffer, embed_dim_);
+                    Add(local_buffer, local_buffer, local_buffer1, embed_dim_);
+                    Cast(local_out_slice_y, local_buffer, AscendC::RoundMode::CAST_TRUNC, embed_dim_);
+                } else {
+                    Mul(local_buffer, slice_x, local_cos, embed_dim_);
+                    Mul(local_buffer1, slice_y, local_sin, embed_dim_);
+                    Sub(local_out_slice_x, local_buffer, local_buffer1, embed_dim_);
+                    Mul(local_buffer, slice_x, local_sin, embed_dim_);
+                    Mul(local_buffer1, slice_y, local_cos, embed_dim_);
+                    Add(local_out_slice_y, local_buffer, local_buffer1, embed_dim_);
+                }
+#if 0
+                Mul(local_buffer, slice_x, local_cos, embed_dim_);
+                Mul(local_buffer1, slice_y, local_sin, embed_dim_);
+                Sub(local_out_slice_x, local_buffer, local_buffer1, embed_dim_);
+                Mul(local_buffer, slice_x, local_sin, embed_dim_);
+                Mul(local_buffer1, slice_y, local_cos, embed_dim_);
+                Add(local_out_slice_y, local_buffer, local_buffer1, embed_dim_);
+#endif
+            }
+            out_que_.EnQue(local_out);
+            local_out = out_que_.DeQue<scalar_t>();
+            AscendC::DataCopy(key_dst_[loop_cnt_kv * load_stride], local_out, tail_heads_kv * head_size_);
+            in_que_.FreeTensor(local_in);
+            out_que_.FreeTensor(local_out);
+            in_que_sin_cos_.FreeTensor(local_sin_cos_deque);
+        }
+#if 0
+        for (int i = 0; i < num_heads_; ++i) {
+            LocT local_in = in_que_.AllocTensor<scalar_t>();
+            LocT local_out1 = out_que_.AllocTensor<scalar_t>();
+            LocT local_out2 = local_out1[embed_dim_];
+            AscendC::DataCopy(local_in, query_[i * head_size_], rot_dim_);
+            in_que_.EnQue(local_in);
+            LocT local_in_deque = in_que_.DeQue<scalar_t>();
+            if constexpr(IS_NEOX) {
+                LocT local_x = local_in_deque;
+                LocT local_y = local_in_deque[embed_dim_];
+                Mul(local_buffer, local_x, local_cos, embed_dim_);
+                Mul(local_buffer1, local_y, local_sin, embed_dim_);
+                Sub(local_out1, local_buffer, local_buffer1, embed_dim_);
+                Mul(local_buffer, local_x, local_sin, embed_dim_);
+                Mul(local_buffer1, local_y, local_cos, embed_dim_);
+                Add(local_out2, local_buffer, local_buffer1, embed_dim_);
+                out_que_.EnQue(local_out1);
+                local_out1 = out_que_.DeQue<scalar_t>();
+                AscendC::DataCopy(query_dst_[i * head_size_], local_out1, rot_dim_);
+            } else {
+                LocT local_x = local_in_deque;
+                LocT local_y = local_in_deque[embed_dim_];
+                // get shuffled buffer in local_buffer and local_buffer1.
+                Gather(local_buffer, local_x, umask1, start_val, embed_dim_);
+                Gather(local_buffer1, local_x, umask2, start_val, embed_dim_);
+
+                Mul(local_x, local_buffer, local_cos, embed_dim_);
+                Mul(local_y, local_buffer1, local_sin, embed_dim_);
+                // The half x will stored on the local_x.
+                Sub(local_x, local_x, local_y, embed_dim_);
+
+                Mul(local_y, local_buffer, local_sin, embed_dim_);
+                Mul(local_buffer1, local_buffer1, local_cos, embed_dim_);
+                // Another half x will stored on the local_y.
+                Add(local_y, local_buffer1, local_y, embed_dim_);
+
+                // We de-shuffle the calc result and copy the local tensor back to the global memory.
+                Gather(local_out1, local_x, umask3, start_val, rot_dim_);
+                out_que_.EnQue(local_out1);
+                local_out1 = out_que_.DeQue<scalar_t>();
+                AscendC::DataCopy(query_dst_[i * head_size_], local_out1, rot_dim_);
+            }
+            out_que_.FreeTensor(local_out1);
+            in_que_.FreeTensor(local_in_deque);
+            // in_que_.FreeTensor(local_in);
+        }
+
+        for (int i = 0; i < num_kv_heads_; ++i) {
+            LocT local_in = in_que_.AllocTensor<scalar_t>();
+            LocT local_out1 = out_que_.AllocTensor<scalar_t>();
+            LocT local_out2 = local_out1[embed_dim_];
+            AscendC::DataCopy(local_in, key_[i * head_size_], rot_dim_);
+            in_que_.EnQue(local_in);
+            LocT local_in_deque = in_que_.DeQue<scalar_t>();
+            if constexpr(IS_NEOX) {
+                LocT local_x = local_in_deque;
+                LocT local_y = local_in_deque[embed_dim_];
+                Mul(local_buffer, local_x, local_cos, embed_dim_);
+                Mul(local_buffer1, local_y, local_sin, embed_dim_);
+                Sub(local_out1, local_buffer, local_buffer1, embed_dim_);
+                Mul(local_buffer, local_x, local_sin, embed_dim_);
+                Mul(local_buffer1, local_y, local_cos, embed_dim_);
+                Add(local_out2, local_buffer, local_buffer1, embed_dim_);
+                out_que_.EnQue(local_out1);
+                local_out1 = out_que_.DeQue<scalar_t>();
+                AscendC::DataCopy(key_dst_[i * head_size_], local_out1, rot_dim_);
+            } else {
+                LocT local_x = local_in_deque;
+                LocT local_y = local_in_deque[embed_dim_];
+                // get shuffled buffer in local_buffer and local_buffer1.
+                Gather(local_buffer, local_x, umask1, start_val, embed_dim_);
+                Gather(local_buffer1, local_x, umask2, start_val, embed_dim_);
+
+                Mul(local_x, local_buffer, local_cos, embed_dim_);
+                Mul(local_y, local_buffer1, local_sin, embed_dim_);
+                // The half x will stored on the local_x.
+                Sub(local_x, local_x, local_y, embed_dim_);
+
+                Mul(local_y, local_buffer, local_sin, embed_dim_);
+                Mul(local_buffer1, local_buffer1, local_cos, embed_dim_);
+                // Another half x will stored on the local_y.
+                Add(local_y, local_buffer1, local_y, embed_dim_);
+
+                // We de-shuffle the calc result and copy the local tensor back to the global memory.
+                Gather(local_out1, local_x, umask3, start_val, rot_dim_);
+                out_que_.EnQue(local_out1);
+                local_out1 = out_que_.DeQue<scalar_t>();
+                AscendC::DataCopy(key_dst_[i * head_size_], local_out1, rot_dim_);
+            }
+            out_que_.FreeTensor(local_out1);
+            in_que_.FreeTensor(local_in_deque);
+            // in_que_.FreeTensor(local_in);
+        }
+    // #if 0
+#endif
+        // #endif
+    }
+
+
+    private:
+        AscendC::TPipe* pipe_;
+        AscendC::TQue<AscendC::QuePosition::VECIN, 1> in_que_, in_que_sin_cos_;
+        AscendC::TQue<AscendC::QuePosition::VECOUT, 1> out_que_;
+        AscendC::TBuf<AscendC::TPosition::VECCALC> calc_buf_;
+        AscendC::TBuf<AscendC::TPosition::VECCALC> interleave_mask_;
+        AscendC::GlobalTensor<scalar_t> query_dst_;
+        AscendC::GlobalTensor<scalar_t> key_dst_;
+        AscendC::GlobalTensor<scalar_t> query_;
+        AscendC::GlobalTensor<scalar_t> key_;
+        AscendC::GlobalTensor<scalar_t> sin_;
+        AscendC::GlobalTensor<scalar_t> cos_;
+        int rot_dim_;
+        int embed_dim_;
+        int64_t query_stride_;
+        int64_t key_stride_;
+        int64_t dst_query_stride_;
+        int64_t dst_key_stride_;
+        int num_heads_;
+        int num_kv_heads_;
+        int head_size_;
+
+};
+
+extern "C" __global__ __aicore__ void add_custom(GM_ADDR x, GM_ADDR y, GM_ADDR z)
+{
+    KernelAdd op;
+    // AscendC::printf("the data of x is %d %d\n", x[0], x[1]);
+    op.Init(x, y, z);
+    op.Process();
+}
+
+#define CAT(x, y) x##y
+#define ROPE_CUSTOM_KERNEL_INSTANTIATION(TYPE, NEOX)    \
+extern "C" __global__ __aicore__ void rope_custom_##NEOX##_##TYPE(      \
+    __gm__ int64_t* positions,                          \
+    __gm__ TYPE* query_dst,                             \
+    __gm__ TYPE* key_dst,                               \
+    __gm__ TYPE* query,                                 \
+    __gm__ TYPE* key,                                   \
+    __gm__ TYPE* cos_sin_cache,                         \
+    const int rot_dim,                                  \
+    const int64_t query_stride,                         \
+    const int64_t key_stride,                           \
+    const int64_t dst_query_stride,                     \
+    const int64_t dst_key_stride,                       \
+    const int num_heads,                                \
+    const int num_kv_heads,                             \
+    const int head_size,                                \
+    const int64_t num_tokens,                               \
+    const int loop_num,                                 \
+    const int core_num) {                               \
+        AscendC::TPipe pipe;                            \
+        KernelRope<TYPE, NEOX> op{};                    \
+        op.Init(                                        \
+            positions,                                  \
+            query_dst,                                  \
+            key_dst,                                    \
+            query,                                      \
+            key,                                        \
+            cos_sin_cache,                              \
+            rot_dim,                                    \
+            dst_query_stride,                           \
+            dst_key_stride,                             \
+            query_stride,                               \
+            key_stride,                                 \
+            num_heads,                                  \
+            num_kv_heads,                               \
+            head_size,                                  \
+            &pipe                                       \
+        );                                              \
+        for (int64_t i = AscendC::GetBlockIdx(); i < num_tokens; i += core_num) {   \
+            op.Update(positions, query_dst, key_dst,    \
+                query, key, cos_sin_cache, rot_dim,     \
+                dst_query_stride, dst_key_stride,       \
+                query_stride, key_stride, num_heads,    \
+                num_kv_heads, head_size, i);            \
+            op.Compute();                               \
+        }                                               \
+    }
+
+
+// #define ROPE_CUSTOM_KERNEL_INSTANTIATION(TYPE, NEOX)    \
+// extern "C" __global__ __aicore__ void rope_custom_##NEOX##_##TYPE(      \
+//     __gm__ int64_t* positions,                          \
+//     __gm__ TYPE* query,                                 \
+//     __gm__ TYPE* key,                                   \
+//     __gm__ TYPE* cos_sin_cache,                         \
+//     const int rot_dim,                                  \
+//     const int64_t query_stride,                         \
+//     const int64_t key_stride,                           \
+//     const int num_heads,                                \
+//     const int num_kv_heads,                             \
+//     const int head_size) {                              \
+//         AscendC::TPipe pipe;                            \
+//         KernelRope<TYPE, NEOX> op{};                    \
+//         op.Init(                                        \
+//             positions,                                  \
+//             query,                                      \
+//             key,                                        \
+//             cos_sin_cache,                              \
+//             rot_dim,                                    \
+//             query_stride,                               \
+//             key_stride,                                 \
+//             num_heads,                                  \
+//             num_kv_heads,                               \
+//             head_size,                                  \
+//             &pipe                                       \
+//         );                                              \
+//     }
+
+#define ITERMEDIATE_EXPAND(TYPE, NEOX)  ROPE_CUSTOM_KERNEL_INSTANTIATION(TYPE, NEOX)
+
+#define ROPE_CUSTOM_KERNEL(TYPE)      \
+    ITERMEDIATE_EXPAND(TYPE, true);   \
+    ITERMEDIATE_EXPAND(TYPE, false);
+
+// ROPE_CUSTOM_KERNEL(float)
+ROPE_CUSTOM_KERNEL(half)
+ROPE_CUSTOM_KERNEL(bfloat16_t)
+
+// #ifndef ASCENDC_CPU_DEBUG
+void add_custom_do(uint32_t blockDim, void *stream, uint8_t *x, uint8_t *y, uint8_t *z) {
+    // printf("block dim is %d\n", blockDim);
+    add_custom<<<blockDim, nullptr, stream>>>(x, y, z);
+}
+
+
+#define ROPE_KERNEL_CALL(TYPE)                                  \
+    if (is_neox)                                                \
+    rope_custom_true_##TYPE<<<BlockDim, nullptr, stream>>>(       \
+        positions,                                              \
+        reinterpret_cast<TYPE*>(query_dst),                     \
+        reinterpret_cast<TYPE*>(key_dst),                       \
+        reinterpret_cast<TYPE*>(query),                                                  \
+        reinterpret_cast<TYPE*>(key),                                                    \
+        reinterpret_cast<TYPE*>(cos_sin_cache),                                          \
+        rot_dim,                                                \
+        query_stride,                                           \
+        key_stride,                                             \
+        dst_query_stride,                                       \
+        dst_key_stride,                                         \
+        num_heads,                                              \
+        num_kv_heads,                                           \
+        head_size,                                              \
+        num_tokens,                                             \
+        loop_cnt,                                               \
+        BlockDim);                                                \
+    else                                                        \
+    rope_custom_false_##TYPE<<<BlockDim, nullptr, stream>>>(    \
+        positions,                                              \
+        reinterpret_cast<TYPE*>(query_dst),                     \
+        reinterpret_cast<TYPE*>(key_dst),                       \
+        reinterpret_cast<TYPE*>(query),                                                  \
+        reinterpret_cast<TYPE*>(key),                                                    \
+        reinterpret_cast<TYPE*>(cos_sin_cache),                                          \
+        rot_dim,                                                \
+        query_stride,                                           \
+        key_stride,                                             \
+        dst_query_stride,                                       \
+        dst_key_stride,                                         \
+        num_heads,                                              \
+        num_kv_heads,                                           \
+        head_size,                                              \
+        num_tokens,                                             \
+        loop_cnt,                                               \
+        BlockDim);
+
+#define INSTANTIATE_ROPE(TYPE, NEOX)        \
+    template void rope_custom_do<TYPE, NEOX>(    \
+    uint32_t blockDim,                      \
+    void* stream,                           \
+    int64_t* positions,                     \
+    TYPE* query,                            \
+    TYPE* key,                              \
+    TYPE* cos_sin_cache,                    \
+    const int rot_dim,                      \
+    const int64_t query_stride,             \
+    const int64_t key_stride,               \
+    const int num_heads,                    \
+    const int num_kv_heads,                 \
+    const int head_size);
+
+// #define INSTANTIATE_TRUE_AND_FALSE(TYPE, INSTANTIATE_TARGET)    \
+//     INSTANTIATE_TARGET(TYPE, true);                             \
+//     INSTANTIATE_TARGET(TYPE, false);
+
+// #define INSTANTIATE_FLOATING_TEMPLATE(OP, ...)    \
+//     INSTANTIATE_##OP(float, __VA_ARGS__)          \
+//     INSTANTIATE_##OP(half, __VA_ARGS__)           \
+//     INSTANTIATE_##OP(bfloat16_t, __VA_ARGS__)     \
+
+
+#define INSTANTIATE_TRUE_AND_FALSE(OP)          \
+    INSTANTIATE_FLOATING_TEMPLATE(OP, true);    \
+    INSTANTIATE_FLOATING_TEMPLATE(OP, false);
+
+#define NAIVE_ADD_CALL()        \
+    
+
+void rope_custom_do_test() {
+    return ;
+}
+static const int64_t max_parallel_size = 65535;
+// template <typename scalar_t, bool IS_NEOX>
+extern void rope_custom_do(
+    turbo_types type,
+    bool is_neox,
+    void* stream,
+    int64_t* positions,
+    void* query_dst,
+    void* key_dst,
+    void* query,
+    void* key,
+    void* cos_sin_cache,
+    const int rot_dim,
+    const int64_t query_stride,
+    const int64_t key_stride,
+    const int64_t dst_query_stride,
+    const int64_t dst_key_stride,
+    const int num_heads,
+    const int num_kv_heads,
+    const int head_size,
+    const int64_t num_tokens,
+    const uint32_t loop_cnt,
+    uint32_t aivNum) {
+        // std::cout << "get into rope" << std::endl;
+        // auto tilingContextHolder = context_ascendc::ContextBuilder().BuildTilingContext();
+        // gert::TilingContext *context = tilingContextHolder->GetContext<gert::TilingContext>();
+        // auto ascendcPlatform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
+        // auto aivNum = ascendcPlatform.GetCoreNumAiv();
+        // aclError ret = aclInit(nullptr);
+        // if (ret != ACL_ERROR_NONE) {
+        //     std::cerr << "Failed to initialize ACL, error code: " << ret << std::endl;
+        //     return -1;
+        // }
+
+        // 获取设备能力
+        // aclrtDeviceCapability capability;
+        // ret = aclrtGetDeviceCapability(0, &capability);
+        // platform_ascendc::PlatformAscendC
+
+        // printf("get into rope %d, %d, %d\n", num_tokens, loop_cnt, aivNum);
+        int BlockDim = max_parallel_size > num_tokens ? num_tokens : max_parallel_size;
+        // int BlockDim = num_tokens > max_parallel_size ? max_parallel_size : num_tokens;
+        if (type == turbo_types::FP16) {
+            ROPE_KERNEL_CALL(half);
+        } else if (type == turbo_types::BF16) {
+            ROPE_KERNEL_CALL(bfloat16_t);
+        } else {
+            return;
+        }
+    }
+
+// INSTANTIATE_TRUE_AND_FALSE(ROPE)
+
+
+
+
+// #endif
