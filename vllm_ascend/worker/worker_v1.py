@@ -18,14 +18,15 @@
 #
 
 import gc
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Any
 
 import torch
 import torch.nn as nn
 import torch_npu
 from vllm import envs
-from vllm.config import VllmConfig
-from vllm.distributed import (ensure_model_parallel_initialized,
+from vllm.config import VllmConfig, ParallelConfig 
+from vllm.distributed import (ensure_kv_transfer_initialized,
+                              ensure_model_parallel_initialized,
                               init_distributed_environment,
                               set_custom_all_reduce)
 from vllm.logger import logger
@@ -41,6 +42,7 @@ from vllm.v1.worker.worker_base import WorkerBase
 from vllm_ascend.platform import NPUPlatform
 from vllm_ascend.utils import try_register_lib, vllm_version_is
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
+from vllm_ascend.distributed.parallel_state import init_ascend_model_parallel
 
 if vllm_version_is("0.8.4"):
     from vllm.distributed import ensure_kv_transfer_initialized
@@ -203,6 +205,8 @@ class NPUWorker(WorkerBase):
 
     def _init_worker_distributed_environment(self) -> None:
         """Initialize the distributed environment."""
+        additional_config = self.vllm_config.additional_config
+        parallel_config = self.vllm_config.parallel_config
         set_custom_all_reduce(
             not self.parallel_config.disable_custom_all_reduce)
         init_distributed_environment(self.parallel_config.world_size,
@@ -211,6 +215,12 @@ class NPUWorker(WorkerBase):
         ensure_model_parallel_initialized(
             self.parallel_config.tensor_parallel_size,
             self.parallel_config.pipeline_parallel_size)
+        expert_tensor_parallel_size = 1
+        if additional_config is not None and "expert_tensor_parallel_size" in additional_config:
+            expert_tensor_parallel_size = int(additional_config["expert_tensor_parallel_size"])
+        init_ascend_model_parallel(parallel_config.tensor_parallel_size,
+                                   parallel_config.pipeline_parallel_size,
+                                   expert_tensor_parallel_size)
         ensure_kv_transfer_initialized(self.vllm_config)
 
     def _init_profiler(self):

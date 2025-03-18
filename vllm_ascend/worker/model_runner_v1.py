@@ -18,7 +18,11 @@
 #
 
 import gc
+<<<<<<< HEAD
 import os
+=======
+import weakref
+>>>>>>> dcd5c73 (Feat: Graph mode for deepseek v2/v3.)
 from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
 import numpy as np
@@ -100,6 +104,28 @@ class NPUModelRunner:
             logger.error(error_msg)
             raise NotImplementedError(
                 "Non-Attention backend is not supported by V1 NPUModelRunner.")
+
+
+        self.attn_backend = get_attn_backend(
+            self.head_size,
+            self.dtype,
+            self.kv_cache_dtype,
+            self.block_size,
+            self.model_config.is_attention_free,
+            use_mla=self.model_config.use_mla,
+        )
+        if self.attn_backend is None:
+            error_msg = (
+                f"Error with get_att_backend: {self.head_size=}, "
+                f"{self.dtype=}, {self.kv_cache_dtype=}, {self.block_size=}, "
+                f"{self.model_config.is_attention_free=}, "
+                f"{self.model_config.use_mla=}")
+            logger.error(error_msg)
+            raise NotImplementedError(
+                "Non-Attention backend is not supported by V1 GPUModelRunner.")
+
+        self.attn_metadata_builder = self.attn_backend.get_builder_cls()(
+            weakref.proxy(self))
 
         # Multi-modal data support
         self.input_registry = INPUT_REGISTRY
@@ -197,6 +223,8 @@ class NPUModelRunner:
         self.input_positions_cpu = torch.arange(0,
                                                 self.max_num_tokens,
                                                 device="cpu")
+        self.attn_mask = None
+        self.attn_state = None
 
         # NOTE: Pre-construct a mask matrix to improve the efficiency of
         # attention mask construction during inference.
@@ -393,7 +421,12 @@ class NPUModelRunner:
         num_reqs = self.input_batch.num_reqs
         assert num_reqs > 0
 
-        # Copy the blocks from CPU to NPU.
+
+        modified_batch = self.attn_metadata_builder.reorder_batch(
+            self.input_batch, scheduler_output)
+        if modified_batch:
+            self.input_batch.refresh_sampling_metadata()
+
         # OPTIMIZATION: Start copying the block table first.
         # This way, we can overlap the copy with the following CPU operations.
         self.input_batch.block_table.commit(num_reqs)
@@ -458,15 +491,14 @@ class NPUModelRunner:
                                               query_lens=num_scheduled_tokens,
                                               position=positions,
                                               attn_state=attn_state)
+        self.attn_mask = attn_mask
+        self.attn_state = attn_state
 
-        attn_metadata = AscendMetadata(
-            seq_lens=query_lens,
-            context_lens=seq_lens,
-            slot_mapping=slot_mapping,
-            block_tables=(
-                self.input_batch.block_table.get_device_tensor()[:num_reqs]),
-            attn_mask=attn_mask,
-            attn_state=attn_state,
+        attn_metadata = self.attn_metadata_builder.build(
+            num_reqs=num_reqs,
+            num_actual_tokens=total_num_scheduled_tokens,
+            max_query_len = max_num_scheduled_tokens,
+            common_prefix_len=None,
         )
 
         # Prepare input_ids
@@ -743,6 +775,9 @@ class NPUModelRunner:
                 # different GPUs, and `kv_cache_config.num_blocks` is set to
                 # the min of all `num_blocks`. Verify it here.
                 assert num_blocks >= kv_cache_config.num_blocks
+                # TODO: remove this after the OOM issue is located and fixed, otherwise, some model may 
+                # encounter OOM issue
+                num_blocks = num_blocks // 4
                 if isinstance(kv_cache_spec, FullAttentionSpec):
                     kv_cache_shape = self.attn_backend.get_kv_cache_shape(
                         num_blocks, kv_cache_spec.block_size,

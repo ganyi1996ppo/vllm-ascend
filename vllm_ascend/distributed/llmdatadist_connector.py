@@ -1,3 +1,4 @@
+
 #
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
 # This file is a part of the vllm-ascend project.
@@ -391,7 +392,6 @@ class LLMDataDistConnector(KVConnectorBase):
             input_cache_key, self.decode_input_buffer, 0)
         self.llm_datadist_engine.kv_transfer.pull_cache(
             hidden_cache_key, self.decode_hidden_buffer, 0)
-
         keys = self.key_cache
         values = self.value_cache
         inputs = self.input_cache
