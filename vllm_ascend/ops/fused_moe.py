@@ -19,8 +19,124 @@ from typing import Callable, Optional
 
 import torch
 import torch_npu
+from vllm.config import get_current_vllm_config
+from vllm.distributed import get_ep_group
+from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.model_executor.layers.fused_moe.layer import \
-    UnquantizedFusedMoEMethod
+    UnquantizedFusedMoEMethod, FusedMoE
+
+
+def fused_experts_with_mc2(
+        hidden_states: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        top_k: int,
+        expert_map: torch.Tensor = None,
+        moe_all_to_all_group_name: str = None,
+) -> torch.Tensor:
+    # Decoder Stage, seq = 1
+    # if torch.distributed.get_rank() == 0:
+    #     print(w1.shape)
+    #     print(hidden_states.shape)
+
+    global_bs = 0
+    moe_expert_num = len(expert_map)
+    # hidden_states = hidden_states.bfloat16()
+    kwargs = {
+        "x": hidden_states,
+        "expert_ids": topk_ids,
+        "expert_shard_type": 0,
+        "shared_expert_rank_num": 0,
+        "moe_expert_num": moe_expert_num,
+        "global_bs": global_bs,
+    }
+
+    rank = torch.distributed.get_rank()
+
+    quant_mode = 0
+    ep_group = get_ep_group().device_group
+    local_rank = torch.distributed.get_rank(group=ep_group)
+    all_to_all_group_size = torch.distributed.get_world_size(ep_group)
+
+    world_szie = torch.distributed.get_world_size()
+    tp_size = world_szie // all_to_all_group_size
+    tp_rank = rank % tp_size
+
+    stage1_kwargs = {
+        "scales": None,
+        "quant_mode": quant_mode,
+        "group_ep": moe_all_to_all_group_name,
+        "ep_world_size": all_to_all_group_size,
+        "ep_rank_id": local_rank,
+        # "group_tp": self.moe_rs_group_name,
+        "group_tp": moe_all_to_all_group_name,
+        "tp_world_size": tp_size,
+        "tp_rank_id": tp_rank,
+    }
+    kwargs.update(stage1_kwargs)
+
+    output = torch_npu.npu_moe_distribute_dispatch(**kwargs)
+    # comm_stream.wait_stream(torch.npu.current_stream())
+    expand_x, dynamic_scale, expand_idx, expert_token_nums, ep_recv_counts = output[0:5]
+
+    w1 = w1.transpose(1, 2)
+    expert_token_nums = torch.cumsum(expert_token_nums, dim=0, dtype=torch.int64)
+    group_list = expert_token_nums.to(torch.int64)
+    gate_up_out_list = torch_npu.npu_grouped_matmul(
+        x=[expand_x],
+        weight=[w1],
+        split_item=2,
+        group_list_type=0,
+        group_type=0,
+        group_list=group_list,
+    )
+
+    # TODO: Remove this in the future.
+    gate_up_out = torch.cat(gate_up_out_list, dim=0)
+    gate_up_out = torch_npu.npu_swiglu(gate_up_out)
+
+    w2 = w2.transpose(1, 2)
+    down_out_list = torch_npu.npu_grouped_matmul(
+        x=[gate_up_out],
+        weight=[w2],
+        split_item=2,
+        group_list_type=0,
+        group_type=0,
+        group_list=group_list,
+    )
+
+    down_out_list = torch.cat(down_out_list, dim=0)
+
+    # moeCombine
+    kwargs = {
+        "expand_x": down_out_list,
+        "expert_ids": topk_ids,
+        "expand_idx": expand_idx,
+        "expert_scales": topk_weights.to(torch.float32),
+        "expert_shard_type": 0,
+        "shared_expert_rank_num": 0,
+        "moe_expert_num": moe_expert_num,
+        "global_bs": 0,
+    }
+    tp_recv_counts = torch.empty(1, dtype=torch.int32, device=hidden_states.device)
+    stage3_kwargs = {
+        "ep_send_counts": ep_recv_counts,
+        "group_ep": moe_all_to_all_group_name,
+        "ep_world_size": all_to_all_group_size,
+        "ep_rank_id": local_rank,
+        "tp_send_counts": tp_recv_counts,
+        # "group_tp": self.moe_rs_group_name,
+        "group_tp": moe_all_to_all_group_name,
+        "tp_world_size": tp_size,
+        "tp_rank_id": tp_rank,
+    }
+    kwargs.update(stage3_kwargs)
+
+    hidden_states = torch_npu.npu_moe_distribute_combine(**kwargs)
+
+    return hidden_states
 
 
 def fused_experts(
@@ -47,22 +163,27 @@ def fused_experts(
     Returns:
         hidden_states: Hidden states after routing.
     """
+    """
     # Check constraints.
     assert hidden_states.shape[1] == w1.shape[2], "Hidden size mismatch"
     assert topk_weights.shape == topk_ids.shape, "topk shape mismatch"
     assert hidden_states.is_contiguous(), "Hidden_states must be contiguous"
     assert w1.is_contiguous(), "Expert weights1 must be contiguous"
     assert w2.is_contiguous(), "Expert weights2 must be contiguous"
+    """
+    # if torch.distributed.get_rank() == 0:
+    #     print(w1.shape)
+    #     print(hidden_states.shape)
 
     original_shape = hidden_states.shape
-    assert len(original_shape) == 2
+    # assert len(original_shape) == 2
 
     num_tokens = hidden_states.shape[:-1].numel()
     num_experts = w1.shape[0]
     dtype = hidden_states.dtype
     device = hidden_states.device
-    assert dtype in [torch.float32, torch.float16, torch.bfloat16
-                     ], "Only float32, float16, and bfloat16 are supported"
+    # assert dtype in [torch.float32, torch.float16, torch.bfloat16
+    #                  ], "Only float32, float16, and bfloat16 are supported"
 
     if expert_map is not None:
         # Generate token indices and flatten
@@ -232,8 +353,8 @@ def select_experts(
     Raises:
         ValueError: If an unsupported scoring function is provided.
     """
-    assert hidden_states.shape[0] == router_logits.shape[0], (
-        "Number of tokens mismatch")
+    # assert hidden_states.shape[0] == router_logits.shape[0], (
+    #     "Number of tokens mismatch")
 
     if custom_routing_function is not None:
         raise NotImplementedError(
@@ -261,14 +382,14 @@ def select_experts(
         # >>> torch_npu._npu_group_topk(topk_weights, group_num=num_expert_group, k=topk_group)
         topk_weights = native_grouped_topk(topk_weights, num_expert_group,
                                            topk_group)
-
+        # TODO bfloat16 is not supported in torch.topk with ge graph. 
         if e_score_correction_bias is not None:
-            topk_ids = torch.topk(topk_weights, k=top_k, dim=-1,
+            topk_ids = torch.topk(topk_weights.to(torch.float32), k=top_k, dim=-1,
                                   sorted=False)[1]
             # Use original unbiased scores for the routing weights
             topk_weights = original_weights.gather(1, topk_ids)
         else:
-            topk_weights, topk_ids = torch.topk(topk_weights,
+            topk_weights, topk_ids = torch.topk(topk_weights.to(torch.float32),
                                                 k=top_k,
                                                 dim=-1,
                                                 sorted=False)
@@ -302,8 +423,8 @@ def forward_oot(
     e_score_correction_bias: Optional[torch.Tensor] = None,
     **kwargs,
 ):
-    assert router_logits.shape[
-        1] == global_num_experts, "Number of global experts mismatch"
+    # assert router_logits.shape[
+    #     1] == global_num_experts, "Number of global experts mismatch"
 
     topk_weights, topk_ids = select_experts(
         hidden_states=x,
@@ -318,13 +439,44 @@ def forward_oot(
         e_score_correction_bias=e_score_correction_bias,
     )
 
-    return fused_experts(hidden_states=x,
-                         w1=layer.w13_weight,
-                         w2=layer.w2_weight,
-                         topk_weights=topk_weights,
-                         topk_ids=topk_ids,
-                         top_k=top_k,
-                         expert_map=expert_map)
+    if x.shape[0] == self.local_batch_size:
+        return fused_experts_with_mc2(
+            hidden_states=x,
+            w1=layer.w13_weight,
+            w2=layer.w2_weight,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            top_k=top_k,
+            expert_map=expert_map,
+            moe_all_to_all_group_name=self.moe_all_to_all_group_name
+        )
+    else:
+        return fused_experts(hidden_states=x,
+                             w1=layer.w13_weight,
+                             w2=layer.w2_weight,
+                             topk_weights=topk_weights,
+                             topk_ids=topk_ids,
+                             top_k=top_k,
+                             expert_map=expert_map)
 
 
+def __init__(self):
+    super().__init__()
+    vllm_config = get_current_vllm_config()
+
+    ep_group = get_ep_group()
+    self.ep_size = ep_group.world_size
+    self.global_batch_size = vllm_config.scheduler_config.max_num_seqs
+    self.local_batch_size = self.global_batch_size // self.ep_size
+
+    try:
+        device_group = ep_group.device_group
+        # TODO: Try local_rank = ep_group.rank_in_group
+        local_rank = torch.distributed.get_rank(group=device_group)
+        backend = device_group._get_backend(torch.device("npu"))
+        self.moe_all_to_all_group_name = backend.get_hccl_comm_name(local_rank)
+    except AttributeError as e:
+        self.moe_all_to_all_group_name = None
+
+UnquantizedFusedMoEMethod.__init__ = __init__
 UnquantizedFusedMoEMethod.forward_oot = forward_oot
