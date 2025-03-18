@@ -18,13 +18,13 @@
 #
 
 import gc
-from typing import Dict, List, Optional, Set, Tuple, Type, Union
+from typing import Dict, List, Optional, Set, Tuple, Type, Union, Any
 
 import torch
 import torch.distributed
 from torch import nn
 from vllm import envs
-from vllm.config import VllmConfig
+from vllm.config import ParallelConfig, VllmConfig
 from vllm.distributed import (ensure_kv_transfer_initialized,
                               ensure_model_parallel_initialized,
                               init_distributed_environment,
@@ -48,6 +48,7 @@ from vllm_ascend.platform import NPUPlatform
 from vllm_ascend.utils import try_register_lib
 from vllm_ascend.worker.model_runner import NPUModelRunner
 from vllm_ascend.worker.pooling_model_runner import NPUPoolingModelRunner
+from vllm_ascend.distributed.parallel_state import init_ascend_model_parallel
 
 
 class NPUWorker(LocalOrDistributedWorkerBase):
@@ -165,7 +166,8 @@ class NPUWorker(LocalOrDistributedWorkerBase):
             raise RuntimeError(
                 f"Not support device type: {self.device_config.device}")
         # Initialize the distributed environment.
-        self._init_worker_distributed_environment(self.vllm_config, self.rank,
+        self._init_worker_distributed_environment(self.vllm_config,
+                                                  self.rank,
                                                   self.distributed_init_method,
                                                   self.local_rank)
         # Set random seed.
@@ -274,8 +276,14 @@ class NPUWorker(LocalOrDistributedWorkerBase):
         for ve in range(self.parallel_config.pipeline_parallel_size):
             num_layers = len(self.cache_engine[ve].gpu_cache)
             for i in range(num_layers):
-                torch_npu.npu_format_cast(self.cache_engine[ve].gpu_cache[i],
-                                          2)
+                if torch.is_tensor(self.cache_engine[ve].gpu_cache[i]):
+                    torch_npu.npu_format_cast(self.cache_engine[ve].gpu_cache[i],
+                                              2)
+                else:
+                    torch_npu.npu_format_cast(self.cache_engine[ve].gpu_cache[i][0],
+                                              2)
+                    torch_npu.npu_format_cast(self.cache_engine[ve].gpu_cache[i][1],
+                                              2)
         self.gpu_cache = [
             self.cache_engine[ve].gpu_cache
             for ve in range(self.parallel_config.pipeline_parallel_size)
@@ -456,6 +464,7 @@ class NPUWorker(LocalOrDistributedWorkerBase):
             backend: str = "hccl") -> None:
         """Initialize the distributed environment."""
         parallel_config = self.parallel_config
+        additional_config = self.vllm_config.additional_config
         set_custom_all_reduce(not parallel_config.disable_custom_all_reduce)
         init_distributed_environment(parallel_config.world_size, rank,
                                      distributed_init_method, local_rank,
@@ -463,7 +472,14 @@ class NPUWorker(LocalOrDistributedWorkerBase):
         ensure_model_parallel_initialized(
             parallel_config.tensor_parallel_size,
             parallel_config.pipeline_parallel_size)
+        expert_tensor_parallel_size = 1
+        if additional_config is not None and hasattr(additional_config, "expert_tensor_parallel_size"):
+            expert_tensor_parallel_size = getattr(additional_config, "expert_tensor_parallel_size")
+        init_ascend_model_parallel(parallel_config.tensor_parallel_size,
+                                   parallel_config.pipeline_parallel_size,
+                                   expert_tensor_parallel_size)
         ensure_kv_transfer_initialized(vllm_config)
+
 
 
 def raise_if_cache_size_invalid(num_gpu_blocks, block_size, is_attention_free,

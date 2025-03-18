@@ -171,12 +171,10 @@ class AscendLinearMethod(LinearMethodBase):
                                                    output_size_per_partition,
                                                    params_dtype)
         for weight_name, weight_param in weight_dict.items():
-            layer.register_parameter(
-                weight_name,
-                ModelWeightParameter(data=weight_param,
-                                     input_dim=1,
-                                     output_dim=0,
-                                     weight_loader=weight_loader))
+            param = torch.nn.Parameter(weight_param, requires_grad=False)
+            set_weight_attrs(param, {"input_dim": 1, "output_dim": 0})
+            layer.register_parameter(weight_name, param)
+            set_weight_attrs(param, extra_weight_attrs)
 
         pertensor_dict = self.quant_method.get_pertensor_param(params_dtype)
         for pertensor_name, pertensor_param in pertensor_dict.items():
@@ -189,11 +187,10 @@ class AscendLinearMethod(LinearMethodBase):
         perchannel_dict = self.quant_method.get_perchannel_param(
             output_size_per_partition, params_dtype)
         for perchannel_name, perchannel_param in perchannel_dict.items():
-            layer.register_parameter(
-                perchannel_name,
-                ChannelQuantScaleParameter(data=perchannel_param,
-                                           output_dim=0,
-                                           weight_loader=weight_loader))
+            param = torch.nn.Parameter(perchannel_param, requires_grad=False)
+            set_weight_attrs(param, {"output_dim": 0})
+            layer.register_parameter(perchannel_name, param)
+            set_weight_attrs(param, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if hasattr(self.quant_method, "process_weights_after_loading"):
@@ -264,6 +261,7 @@ class AscendKVCacheMethod(BaseKVCacheMethod):
                                        seq_lens_tensor_cpu=seq_lens_tensor_cpu)
 
 
+# not sure if this is works on main branch
 def fused_moe_perchannel_weight_loader(param: torch.nn.Parameter,
                                        loaded_weight: torch.Tensor,
                                        weight_name: str, shard_id: str,
@@ -360,16 +358,19 @@ class AscendFusedMoEMethod(FusedMoEMethodBase):
         top_k: int,
         router_logits: torch.Tensor,
         renormalize: bool,
+        global_num_experts: int,
+        expert_map: torch.Tensor,
         topk_group: Optional[int] = None,
         num_expert_group: Optional[int] = None,
+        is_prefill: bool = True,
         custom_routing_function: Optional[Callable] = None,
         scoring_func: str = "softmax",
         e_score_correction_bias: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         return self.quant_method.apply(layer, x, use_grouped_topk, top_k,
                                        router_logits, renormalize, topk_group,
-                                       num_expert_group,
-                                       custom_routing_function, scoring_func,
+                                       num_expert_group, global_num_experts, expert_map,
+                                       is_prefill, custom_routing_function, scoring_func,
                                        e_score_correction_bias)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
