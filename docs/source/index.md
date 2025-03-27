@@ -35,7 +35,8 @@ By using vLLM Ascend plugin, popular open-source models, including Transformer-l
 :maxdepth: 1
 quick_start
 installation
-tutorials
+tutorials/index.md
+faqs
 :::
 
 % What does vLLM Ascend Plugin support?
@@ -47,10 +48,17 @@ user_guide/supported_models
 user_guide/release_notes
 :::
 
-% How to contribute to the vLLM project
+% How to contribute to the vLLM Ascend project
 :::{toctree}
 :caption: Developer Guide
 :maxdepth: 1
 developer_guide/contributing
 developer_guide/versioning_policy
+:::
+
+% User stories about vLLM Ascend project
+:::{toctree}
+:caption: User Story
+:maxdepth: 1
+user_stories/index
 :::
