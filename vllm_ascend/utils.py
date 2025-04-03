@@ -19,6 +19,10 @@
 import torch
 
 import os
+import time
+import torch
+import torch_npu
+from contextlib import contextmanager
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
@@ -56,3 +60,41 @@ def current_stream() -> torch.npu.Stream:
         # we return the default stream.
         _current_stream = torch.npu.current_stream()
     return _current_stream
+
+@contextmanager
+def profiling_this(encoder_count, is_prefill):
+    profiling_path = os.environ.get("VLLM_ENABLE_PROFILING_PATH", "/home/w00613869/vllm_ws/profiling/")
+    torch.npu.synchronize()
+    start_time = time.time()
+    if int(os.environ.get("VLLM_ENABLE_PROFILING", "0")) == 0:
+        yield
+    else:
+        if encoder_count == 50:
+            experimental_config = torch_npu.profiler._ExperimentalConfig(
+                aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization,
+                profiler_level=torch_npu.profiler.ProfilerLevel.Level0,
+                data_simplification=False
+            )
+            with torch_npu.profiler.profile(
+                activities=[
+                    torch_npu.profiler.ProfilerActivity.CPU,
+                    torch_npu.profiler.ProfilerActivity.NPU],
+                with_stack=False,
+                record_shapes=False,
+                profile_memory=False,
+                schedule=torch_npu.profiler.schedule(wait=0, warmup=0, active=1, repeat=1, skip_first=0),
+                on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(profiling_path),
+                experimental_config=experimental_config
+            ):
+            
+                yield  # 在此处执行目标代码行
+        else:
+            yield
+    torch.npu.synchronize()
+    end_time = time.time()
+    run_time = end_time - start_time
+    if is_prefill:
+        model_name = "perfill"
+    else:
+        model_name = "decoder"
+    print(f"{model_name} inference time cost is: {run_time * 1000:.2f} ms")
