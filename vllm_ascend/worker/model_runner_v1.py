@@ -18,13 +18,14 @@
 #
 
 import gc
+import weakref
 from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
 import numpy as np
 import torch
 import torch.distributed
 import torch.nn as nn
-from vllm.attention import AttentionType
+from vllm.attention import AttentionType, get_attn_backend
 from vllm.attention.layer import Attention
 from vllm.config import VllmConfig
 from vllm.distributed.parallel_state import get_pp_group
@@ -101,6 +102,28 @@ class NPUModelRunner:
         self.num_kv_heads = model_config.get_num_kv_heads(parallel_config)
         self.head_size = model_config.get_head_size()
         self.hidden_size = model_config.get_hidden_size()
+
+
+        self.attn_backend = get_attn_backend(
+            self.head_size,
+            self.dtype,
+            self.kv_cache_dtype,
+            self.block_size,
+            self.model_config.is_attention_free,
+            use_mla=self.model_config.use_mla,
+        )
+        if self.attn_backend is None:
+            error_msg = (
+                f"Error with get_att_backend: {self.head_size=}, "
+                f"{self.dtype=}, {self.kv_cache_dtype=}, {self.block_size=}, "
+                f"{self.model_config.is_attention_free=}, "
+                f"{self.model_config.use_mla=}")
+            logger.error(error_msg)
+            raise NotImplementedError(
+                "Non-Attention backend is not supported by V1 GPUModelRunner.")
+
+        self.attn_metadata_builder = self.attn_backend.get_builder_cls()(
+            weakref.proxy(self))
 
         # Multi-modal data support
         self.input_registry = INPUT_REGISTRY
@@ -209,6 +232,7 @@ class NPUModelRunner:
         self.input_positions_cpu = torch.arange(0,
                                                 self.max_num_tokens,
                                                 device="cpu")
+        self.attn_mask = None
 
     def _update_states(self, scheduler_output: "SchedulerOutput") -> None:
         """Update the cached states and the persistent batch with the scheduler
@@ -396,6 +420,12 @@ class NPUModelRunner:
         num_reqs = self.input_batch.num_reqs
         assert num_reqs > 0
 
+
+        modified_batch = self.attn_metadata_builder.reorder_batch(
+            self.input_batch, scheduler_output)
+        if modified_batch:
+            self.input_batch.refresh_sampling_metadata()
+
         # OPTIMIZATION: Start copying the block table first.
         # This way, we can overlap the copy with the following CPU operations.
         self.input_batch.block_table.commit(num_reqs)
@@ -444,17 +474,15 @@ class NPUModelRunner:
         slot_mapping = self.slot_mapping_cpu[:total_num_scheduled_tokens].to(
             self.device, non_blocking=True)
 
-        attn_mask = self.make_attention_mask(
+        self.attn_mask = self.make_attention_mask(
             self.vllm_config.model_config.dtype, self.device,
             max(seq_lens, default=0), seq_lens, num_scheduled_tokens)
 
-        attn_metadata = AscendMetadata(
-            seq_lens=query_lens,
-            context_lens=seq_lens,
-            slot_mapping=slot_mapping,
-            block_tables=(
-                self.input_batch.block_table.get_device_tensor()[:num_reqs]),
-            attn_mask=attn_mask,
+        attn_metadata = self.attn_metadata_builder.build(
+            num_reqs=num_reqs,
+            num_actual_tokens=total_num_scheduled_tokens,
+            max_query_len = max_num_scheduled_tokens,
+            common_prefix_len=None,
         )
 
         # prepare input_ids

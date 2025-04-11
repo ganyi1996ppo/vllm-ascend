@@ -366,7 +366,7 @@ class CustomDeepseekV2DecoderLayer(DeepseekV2DecoderLayer):
         # with the layer's index.
         layer_idx = int(prefix.split(sep='.')[-1])
         # TODO: enable mla in vllm-ascend
-        if model_config.use_mla and not envs.VLLM_USE_V1:
+        if model_config.use_mla:
             attn_cls = CustomDeepseekV2MLAAttention
         else:
             attn_cls = DeepseekV2Attention
