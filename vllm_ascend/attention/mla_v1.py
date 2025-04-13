@@ -16,7 +16,8 @@ from vllm.model_executor.layers.linear import (ColumnParallelLinear,
                                                UnquantizedLinearMethod)
 from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
-from vllm_ascend.ops.attention import vanilla_chunked_prefill_mla
+from vllm_ascend.ops.attention import vanilla_chunked_prefill_mla, vanilla_decode_mla
+from vllm_ascend.ops.cache import concat_and_cache_mla
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
@@ -457,8 +458,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         decode_meta = attn_metadata.decode
         assert decode_meta is not None
 
-        q = torch.cat([q_nope, q_pe], dim=-1)\
-            .unsqueeze(1) # Add seqlen dim of 1 (decode)
+        q = torch.cat([q_nope, q_pe], dim=-1)
         num_tokens = q.size(0)
         attn_output = torch.randn(
             [num_tokens, self.num_heads, self.kv_lora_rank],
@@ -541,11 +541,13 @@ class AscendMLAImpl(MLAAttentionImpl):
                 prefill_q_pe.contiguous(), prefill_k_pe)
 
         if kv_cache.numel() > 0:
-            key = torch.cat([k_c_normed.view([num_actual_toks, self.num_kv_heads, -1]), k_pe], dim=2)
-            torch_npu._npu_reshape_and_cache_siso(
-                key=key, 
-                key_cache=kv_cache, 
-                slot_indices=attn_metadata.slot_mapping.flatten())
+            concat_and_cache_mla(k_c_normed, k_pe, kv_cache, attn_metadata.slot_mapping.flatten())
+            # TODO: replaced back to ascend ops
+            # key = torch.cat([k_c_normed.view([num_actual_toks, self.num_kv_heads, -1]), k_pe], dim=2)
+            # torch_npu._npu_reshape_and_cache_siso(
+            #     key=key, 
+            #     key_cache=kv_cache, 
+            #     slot_indices=attn_metadata.slot_mapping.flatten())
 
         if has_prefill:
             output[num_decode_tokens:] = self._forward_prefill(

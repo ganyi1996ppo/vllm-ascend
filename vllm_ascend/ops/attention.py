@@ -15,7 +15,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Optional
+from typing import Optional, List
 import torch
 from vllm.model_executor.layers.linear import ColumnParallelLinear
 # Implementation of vanilla chunked prefill, should be removed after the kernel is ready for 
@@ -249,5 +249,50 @@ def vanilla_chunked_prefill_mla(
     output.copy_(attn_output)
     return attn_output
 
+def vanilla_decode_mla(
+    query: torch.Tensor,      # [num_tokens, num_heads, latent_dim + rope_dim]
+    key_cache: torch.Tensor,  # [num_blocks, block_size, num_kv_heads, latent_dim + rope_dim]
+    num_kv_heads: int,
+    num_heads: int,
+    scale: float,
+    block_table: torch.Tensor,  # [batch_size, max_block_size]
+    context_lens: List[int],
+    mla_vhead_size: int,
+    rope_dim: int,
+    output: torch.Tensor
+):
+    batch_size = block_table.size()[0]
+    max_block_size = block_table.size()[1]
+    reduce_dim = key_cache.size()[-1]
+    block_size = key_cache.size()[1]
+    latent_dim = reduce_dim - rope_dim
+    num_tokens = query.size()[0]
+    head_ratio = num_heads // num_kv_heads
+    kv_c_and_pe = key_cache[block_table].view([batch_size, max_block_size * block_size, num_kv_heads, reduce_dim])
+    max_context_len = max(context_lens)
+    context_lens = torch.tensor(context_lens, device="npu").view(batch_size, 1)
+    # [batch_size, max_context_len, num_kv_heads, latent_dim + rope_dim]
+    # since the kv head is 1 in deepseek, we use expand here for perf
+    kv_c_and_pe = kv_c_and_pe[:, :max_context_len, :, :].expand(-1, -1, num_heads, 1)
+    kv_c = kv_c_and_pe[..., :latent_dim]
+    kv_idx_mask = (
+        torch.arange(0, max_context_len, device="npu").view(1, -1).repeat(batch_size, 1)
+    )
+    # [batch_size, max_context_len]
+    kv_idx_mask = kv_idx_mask < context_lens
+    query = query.unsqueeze(1)
+    attn_weights = torch.einsum("bqhd,bkhd->bhqk", query, kv_c_and_pe)
+    attn_weights *= scale
+    attn_weights = attn_weights + kv_idx_mask[:, -1, -1, :].float()
+    attn_weights = torch.softmax(attn_weights, dim=-1)
+    attn_output = torch.einsum("bhqk,bkhd->bqhd", attn_weights, kv_c.float()).view(-1, num_heads, latent_dim)
+    output.copy_(attn_output)
+    return output
 
+
+
+
+
+
+    
 

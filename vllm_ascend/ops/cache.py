@@ -24,7 +24,10 @@ def concat_and_cache_mla(
     kv_cache: torch.Tensor,     # [num_blocks, block_size, num_kv_head, nope + rope]
     slot_mapping,               # [num_tokens]
 ):
-  block_size = kv_cache.size()
-  block_idx = slot_mapping / block_size
-  slot_idx = slot_mapping % block_size
-  kv_cache[block_idx, ...][:, slot_idx, ...] = torch.cat([kv_c_normed, k_pe], dim=-1)
+  num_blocks = kv_cache.size()[0]
+  block_size = kv_cache.size()[1]
+  num_kv_head = k_pe.size()[1]
+
+  idx_for_copy = slot_mapping // block_size * block_size + slot_mapping % block_size
+  kv_cache = kv_cache.view(num_blocks * block_size, num_kv_head, -1)
+  kv_cache[idx_for_copy] = torch.cat([kv_c_normed.unsqueeze(1), k_pe], dim=-1)
