@@ -153,6 +153,8 @@ def vanilla_chunked_prefill_mla(
     alibi_slopes: Optional[torch.Tensor],
     causal: bool = True
 ) -> None:
+    batch_size = block_tables.size(0)
+    assert query_lens.size(0) == batch_size
     num_tokens = query.size(0)
     num_heads = query.size(1)
     num_blocks = kv_cache.size(0)
@@ -160,6 +162,7 @@ def vanilla_chunked_prefill_mla(
     latent_kv_dim = kv_cache.size(3) - rope_dim
     max_num_blocks_per_seq = block_tables.size(1)
     batch_size = query_lens.size(0)
+    kv_cache = kv_cache.squeeze()
     # select kv_c out as [batch_size, max_context_len, latent_kv + rope_dim]
     cache_kv_c_pe = kv_cache[block_tables].view(batch_size, max_num_blocks_per_seq * block_size, latent_kv_dim + rope_dim)[:, :max_context_len, :]
     # get kv_c and k_pe
@@ -170,10 +173,12 @@ def vanilla_chunked_prefill_mla(
     # get k_rope and v
     # k_nope: [batch_size, max_context_len, num_heads, nope_dim]
     # value:  [batch_size, max_context_len, num_heads, v_head_dim]
-    k_nope, value = kv_b_proj(cache_kv_c)[0].split([nope_dim, v_head_dim], dim=-1)
+    k_nope, value = kv_b_proj(cache_kv_c)[0].view(batch_size, max_context_len, num_heads, nope_dim + v_head_dim).split([nope_dim, v_head_dim], dim=-1)
     # key:    [batch_size, max_context_len, num_hads, rope_dim + nope_dim]
-    key = torch.cat([k_nope, cache_k_pe.unsqueeze(1).expand(-1, -1, num_heads, -1)], dim=-1)
+    key = torch.cat([k_nope, cache_k_pe.unsqueeze(2).expand(-1, -1, num_heads, -1)], dim=-1)
 
+    context_lens = context_lens.view(-1, 1).to("npu")
+    query_lens = query_lens.view(-1, 1).to("npu")
     seq_diff = context_lens - query_lens
 
     q_idx_mask = (

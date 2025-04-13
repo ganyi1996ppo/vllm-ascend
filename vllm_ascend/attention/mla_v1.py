@@ -1,37 +1,33 @@
 import functools
 from abc import abstractmethod
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Generic, Optional, TypeVar
+from typing import TYPE_CHECKING, Any, Generic, Optional, TypeVar, Type
 
 import torch
+import torch_npu
 import numpy as np
 from vllm import _custom_ops as ops
 from vllm.attention.backends.abstract import (AttentionBackend, AttentionLayer,
                                               AttentionMetadata,
                                               MLAAttentionImpl)
-from vllm.attention.ops.triton_merge_attn_states import merge_attn_states
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import (ColumnParallelLinear,
                                                LinearBase, RowParallelLinear,
                                                UnquantizedLinearMethod)
 from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
-from vllm.platforms import current_platform
-from vllm.utils import cdiv, round_down
-from vllm.vllm_flash_attn.fa_utils import get_flash_attn_version
-from vllm.v1.attention.backends.mla.common import (MLACommonPrefillMetadata, MLACommonDecodeMetadata, MLACommonMetadata, MLACommonMetadataBuilder, MLACommonBackend, MLACommonImpl) 
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
-from vllm_ascend.attention.attention import AttentionMaskBuilder
-from vllm_ascend.ops.attention import vanilla_chunked_prefill, vanilla_chunked_prefill_mla
+from vllm_ascend.ops.attention import vanilla_chunked_prefill_mla
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
     from vllm.v1.worker.gpu_input_batch import InputBatch
-    from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 logger = init_logger(__name__)
 
 
-class AscendMLABackend(MLACommonBackend):
+class AscendMLABackend(AttentionBackend):
+
+    accept_output_buffer: bool = True
 
     @staticmethod
     def get_name() -> str:
@@ -42,9 +38,21 @@ class AscendMLABackend(MLACommonBackend):
         return AscendMLAMetadata
 
     @staticmethod
-    def get_builder_cls() -> type["MLACommonMetadataBuilder"]:
+    def get_builder_cls():
         return AscendMLAMetadataBuilder
 
+    @staticmethod
+    def get_kv_cache_shape(
+        num_blocks: int,
+        block_size: int,
+        num_kv_heads: int,
+        head_size: int
+    ) -> tuple[int, ...]:
+        return (num_blocks, block_size, num_kv_heads, head_size)
+
+    @staticmethod
+    def get_impl_cls() -> Type["MLAAttentionImpl"]:
+        return AscendMLAImpl
 
 
 @dataclass
@@ -71,7 +79,7 @@ class AscendMLADecodeMetadata:
 
 
 @dataclass
-class AscendMLAMetadata(MLACommonMetadata):
+class AscendMLAMetadata:
     """Metadata for MLACommon.
 
     NOTE: Please read the comment at the top of the file before trying to
@@ -104,18 +112,19 @@ class AscendMLAMetadata(MLACommonMetadata):
     prefill: Optional[AscendMLAPrefillMetadata] = None
 
     def __post_init__(self):
-        supported_head_sizes = AscendMLABackend.get_supported_head_sizes()
-        if self.head_dim is not None and self.head_dim \
-                not in supported_head_sizes:
-            raise ValueError(
-                f"Only {supported_head_sizes} are supported for head_dim,",
-                f"received {self.head_dim}.")
+        pass
+        # supported_head_sizes = AscendMLABackend.get_supported_head_sizes()
+        # if self.head_dim is not None and self.head_dim \
+        #         not in supported_head_sizes:
+        #     raise ValueError(
+        #         f"Only {supported_head_sizes} are supported for head_dim,",
+        #         f"received {self.head_dim}.")
 
 
 M = TypeVar("M", bound=AscendMLAMetadata)
 
 
-class AscendMLAMetadataBuilder(MLACommonMetadataBuilder):
+class AscendMLAMetadataBuilder:
     """
     NOTE: Please read the comment at the top of the file before trying to
     understand this class
@@ -213,7 +222,7 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder):
             device, non_blocking=True).long()
 
         seq_lens_cpu = self.runner.seq_lens_cpu[:num_reqs]
-        query_lens = seq_lens_cpu - self.runner.input_batch.num_computed_tokens_cpu_tensor
+        query_lens = seq_lens_cpu - self.runner.input_batch.num_computed_tokens_cpu_tensor[:num_reqs]
         seq_lens = seq_lens_cpu
         max_query_len = query_lens.max().item()
         max_context_len = seq_lens.max().item()
@@ -225,7 +234,7 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder):
 
             prefill_metadata = AscendMLAPrefillMetadata(
                 attn_mask=self.runner.attn_mask,
-                query_lens=query_lens,
+                query_lens=query_lens[tokens_start:],
                 context_lens=seq_lens[tokens_start:],
                 input_positions=input_positions[tokens_start:],
                 block_table=block_table[reqs_start:, ...],
@@ -253,7 +262,7 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder):
         )
 
 
-class AscendMLAImpl(MLACommonImpl):
+class AscendMLAImpl(MLAAttentionImpl):
     """
     NOTE: Please read the comment at the top of the file before trying to
     understand this class
@@ -285,6 +294,7 @@ class AscendMLAImpl(MLACommonImpl):
         q_proj: ColumnParallelLinear,
         kv_b_proj: ColumnParallelLinear,
         o_proj: RowParallelLinear,
+        **kwargs,
     ) -> None:
         self.num_heads = num_heads
         self.head_size = head_size
@@ -415,10 +425,6 @@ class AscendMLAImpl(MLACommonImpl):
                                     self.v_head_dim,
                                     dtype=query.dtype,
                                     device=query.device)
-        mask = attn_metadata.prefill.attn_mask
-        self.seq_lens_tensor_cpu = torch.from_numpy(
-            np.array(attn_metadata.prefill.seq_lens).astype(
-                np.int32))
         # current requests is chunked in prefill, disable flash attention with chunked prefill
         vanilla_chunked_prefill_mla(
             output=attn_output,
@@ -436,6 +442,7 @@ class AscendMLAImpl(MLACommonImpl):
             scale=self.scale,
             alibi_slopes=None,
             causal=True)
+        attn_output = attn_output.view([num_tokens, self.num_heads * self.v_head_dim])
         return self.o_proj(attn_output)[0]
 
     def _forward_decode(

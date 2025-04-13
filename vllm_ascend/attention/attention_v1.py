@@ -23,13 +23,10 @@ import torch_npu
 from vllm.attention.backends.abstract import (AttentionBackend, AttentionImpl,
                                               AttentionLayer, AttentionType)
 from vllm.attention.backends.utils import CommonAttentionState
-from vllm.v1.attention.backends.flash_attn import FlashAttentionMetadataBuilder
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.worker.gpu_input_batch import InputBatch
-from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 from vllm_ascend.ops.attention import vanilla_chunked_prefill
-from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
 class AscendAttentionBackend(AttentionBackend):
 
@@ -116,9 +113,13 @@ class AscendMetadata:
     attn_mask: Optional[torch.Tensor] = None
 
 
-class AscendAttentionMetadataBuilder(FlashAttentionMetadataBuilder):
-    def __init__(self, runner: "NPUModelRunner"):
+class AscendAttentionMetadataBuilder:
+    def __init__(self, runner):
         self.runner = runner
+
+    def reorder_batch(self, input_batch: "InputBatch",
+                      scheduler_output: "SchedulerOutput") -> bool:
+        return False
 
     def build(self, num_reqs, num_actual_tokens, max_query_len, common_prefix_len):
         block_table = (

@@ -766,7 +766,7 @@ class NPUModelRunner:
                 # encounter OOM issue
                 num_blocks = num_blocks // 4
                 if isinstance(kv_cache_spec, FullAttentionSpec):
-                    kv_cache_shape = AscendAttentionBackend.get_kv_cache_shape(
+                    kv_cache_shape = self.attn_backend.get_kv_cache_shape(
                         num_blocks, kv_cache_spec.block_size,
                         kv_cache_spec.num_kv_heads, kv_cache_spec.head_size)
                     dtype = kv_cache_spec.dtype
