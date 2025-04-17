@@ -38,7 +38,7 @@ from vllm.model_executor.model_loader import get_model
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalKwargs
 from vllm.sampling_params import SamplingType
 from vllm.sequence import IntermediateTensors
-from vllm.utils import DeviceMemoryProfiler, LayerBlockType, cdiv
+from vllm.utils import (STR_DTYPE_TO_TORCH_DTYPE, DeviceMemoryProfiler, LayerBlockType, cdiv)
 from vllm.v1.core.encoder_cache_manager import compute_encoder_budget
 from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig,
                                         KVCacheSpec)
@@ -75,6 +75,12 @@ class NPUModelRunner:
         self.num_attn_layers = self.model_config.get_num_layers_by_block_type(
             vllm_config.parallel_config, LayerBlockType.attention)
         self.hidden_size = self.model_config.get_hidden_size()
+        self.head_size = self.model_config.get_head_size()
+        self.dtype = self.model_config.dtype
+        if vllm_config.cache_config.cache_dtype == "auto":
+            self.kv_caches_dtype = self.dtype
+        else:
+            self.kv_caches_dtype = STR_DTYPE_TO_TORCH_DTYPE[vllm_config.cache_config.cache_dtype]
 
 
         self.attn_backend = get_attn_backend(
@@ -194,7 +200,6 @@ class NPUModelRunner:
         self.input_positions_cpu = torch.arange(0,
                                                 self.max_num_tokens,
                                                 device="cpu")
-        self.attn_mask = None
 
         # NOTE: Pre-construct a mask matrix to improve the efficiency of
         # attention mask construction during inference.
@@ -465,10 +470,6 @@ class NPUModelRunner:
                out=self.slot_mapping_np[:total_num_scheduled_tokens])
         slot_mapping = self.slot_mapping_cpu[:total_num_scheduled_tokens].to(
             self.device, non_blocking=True)
-
-        self.attn_mask = self.make_attention_mask(
-            self.vllm_config.model_config.dtype, self.device,
-            max(seq_lens, default=0), seq_lens, num_scheduled_tokens)
 
         attn_metadata = self.attn_metadata_builder.build(
             num_reqs=num_reqs,
