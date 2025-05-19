@@ -67,7 +67,7 @@ class LLMDataDistConnectorMetadata(KVConnectorMetadata):
         remote_port=kv_transfer_params["remote_port"],
     )
 
-class LLMDataDistConnector(KVConnectorBase_V1):
+class LLMDataDistConnectorA3(KVConnectorBase_V1):
   def __init__(self, vllm_config: VllmConfig, role: KVConnectorRole):
     if role == KVConnectorRole.SCHEDULER:
       self.connector_scheduler: Optional[LLMDataDistConnectorScheduler] = LLMDataDistConnectorScheduler(vllm_config)

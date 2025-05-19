@@ -30,3 +30,8 @@ KVConnectorFactory.register_connector(
     "AscendHcclConnectorV1",
     "vllm_ascend.distributed.llmdatadist_connector_v1",
     "LLMDataDistConnectorV1")
+
+KVConnectorFactory.register_connector(
+    "AscendHcclConnectorV1A3",
+    "vllm_ascend/distributed/llmdatadist_connector_v1_a3",
+    "LLMDataDistConnectorA3")
