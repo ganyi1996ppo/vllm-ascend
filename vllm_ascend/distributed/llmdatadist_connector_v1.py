@@ -272,9 +272,10 @@ def fetch_prefill_info(meta_server_url, request_ids):
 
 class KVTransferEngine:
 
-    def __init__(self, role: llm_datadist.LLMRole, local_rank: int,
+    def __init__(self, role: llm_datadist.LLMRole, rank: int, local_rank: int,
                  dp_rank: int, tp_rank: int, local_server_id: str) -> None:
         self.role = role
+        self.rank = rank
         self.local_rank = local_rank
         self.tp_rank = tp_rank
         self.cluster_info = get_cluster_info()
@@ -301,6 +302,20 @@ class KVTransferEngine:
             options["llm.listenIpInfo"] = f"{self.local_device_ip}:26000"
         self.datadist_engine.init(options)
         self.kv_transfer = self.datadist_engine.kv_cache_manager
+    
+    def parpare_data_dist_a3(self):
+        llm_config = llm_datadist.LLMConfig()
+        llm_config.device_id = self.local_rank
+        llm_config.enable_switch_role = True
+        llm_config.enable_cache_manager = True
+        llm_config.sync_kv_timeout = envs.LLMDATADIST_SYNC_CACHE_WAIT_TIME
+        llm_config.enable_remote_cache_accessible = True
+        llm_config.mem_pool_cfg = "{\"memory_size\": 18737418240, \"page_shift\": 16}"
+        options = llm_config.generate_options()
+        print(f"prepare datadist, options: {options}")
+        self.datadist_engine.init(options)
+        self.kv_transfer = self.datadist_engine.cache_manager
+        print(f"{self.rank} rank data dist is ready")
 
     def make_cluster(self, prefill_ip, cluster_id=-1):
         cluster = llm_datadist.LLMClusterInfo()
@@ -324,6 +339,111 @@ class KVTransferEngine:
                                                 device.cluster_id)
                     clusters.append(cluster)
         return clusters
+
+    def connnect_clusters_a3(self, global_rank_table):
+        comm_name, cluster_rank_info, rank_table = self._prepare_link_info(global_rank_table)
+        comm_id = self.datadist_engine.link(comm_name, cluster_rank_info, json.dumps(rank_table))
+        while True:
+            ret = self.datadist_engine.query_register_mem_status(comm_id)
+            if ret == llm_datadist.RegisterMemStatus.OK:
+                logger.info(f"init link suc, comm_id: {comm_id}")
+                break
+            elif ret == llm_datadist.RegisterMemStatus.FAILED:
+                logger.error(f"init link failed, comm_id: {comm_id}")
+                raise RuntimeError("link failed")
+            logger.info("Check query_register_mem_status again...")
+            time.sleep(1)
+        return comm_id
+
+
+    def _prepare_link_info(self, global_rank_table):
+        # This function reads global rank table file and generates
+        # local rank_table needed for link cluster
+        decode_device_list = global_rank_table["decode_device_list"]
+        prefill_device_list = global_rank_table["prefill_device_list"]
+        decode_device_info = decode_device_list[self.d_device_rank]
+        prefill_device_info = prefill_device_list[self.p_device_rank]
+        decode_device_ip = decode_device_info["device_ip"]
+        prefill_device_ip = prefill_device_info["device_ip"]
+        # Communation range name.
+        comm_name = f"pd_comm_{prefill_device_ip}_{decode_device_ip}"
+        cluster_rank_info = {
+            self.prefill_cluster_id: 0,
+            self.decode_cluster_id: 1,
+        }
+        rank_table = {}
+        version = "1.2"
+        server_count = (
+            1
+            if prefill_device_info["server_id"]
+            == decode_device_info["server_id"]
+            else 2
+        )
+        rank_table["version"] = version
+        rank_table["server_count"] = str(server_count)
+        rank_table["status"] = "completed"
+        prefill_server_device_info = {
+            "device": [
+                {
+                    "device_id": prefill_device_info["device_id"],
+                    "device_ip": prefill_device_info["device_ip"],
+                    "super_device_id": prefill_device_info["super_device_id"],
+                    "rank_id": "0",
+                }
+            ],
+            "server_id": prefill_device_info["server_id"],
+        }
+        rank_table["server_list"] = [prefill_server_device_info]
+        if server_count == 2:
+            decode_server_device_info = {
+                "device": [
+                    {
+                        "device_id": decode_device_info["device_id"],
+                        "device_ip": decode_device_info["device_ip"],
+                        "super_device_id": decode_device_info["super_device_id"],
+                        "rank_id": "1",
+                    }
+                ],
+                "server_id": decode_device_info["server_id"],
+            }
+            rank_table["server_list"].append(decode_server_device_info)
+        else:
+            decode_device_server_info = {
+                "device_id": decode_device_info["device_id"],
+                "device_ip": decode_device_info["device_ip"],
+                "super_device_id": decode_device_info["super_device_id"],
+                "rank_id": "1",
+            }
+            rank_table["server_list"][0]["device"].append(
+                decode_device_server_info
+            )
+        if version == "1.2":
+            super_pod_list = []
+            prefill_super_pod_info = {
+                "super_pod_id": prefill_device_info["super_pod_id"],
+                "server_list": [
+                    {"server_id": prefill_device_info["server_id"]}
+                ],
+            }
+            super_pod_list.append(prefill_super_pod_info)
+            if (
+                decode_device_info["super_pod_id"]
+                == prefill_device_info["super_pod_id"]
+            ):
+                if server_count == 2:
+                    super_pod_list[0]["server_list"].append(
+                        {"server_id": decode_device_info["server_id"]}
+                    )
+            else:
+                decode_super_pod_info = {
+                    "super_pod_id": decode_device_info["super_pod_id"],
+                    "server_list": [
+                        {"server_id": decode_device_info["server_id"]}
+                    ],
+                }
+                super_pod_list.append(decode_super_pod_info)
+            rank_table["super_pod_list"] = super_pod_list
+        return comm_name, cluster_rank_info, rank_table
 
 
 @dataclass
