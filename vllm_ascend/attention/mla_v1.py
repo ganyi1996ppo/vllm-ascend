@@ -999,8 +999,8 @@ class AscendMLAImpl(MLAAttentionImpl):
         else:
             assert len(kv_c_and_k_pe_cache) > 1
             attn_output = torch_npu.atb.npu_multi_head_latent_attention(
-                q_nope, q_pe, kv_c_and_k_pe_cache[0],
-                kv_c_and_k_pe_cache[1], attn_metadata.decode.block_table,
+                q_nope, q_pe, kv_c_and_k_pe_cache[0], kv_c_and_k_pe_cache[1],
+                attn_metadata.decode.block_table,
                 attn_metadata.decode.seq_lens, self.num_heads, self.scale,
                 self.num_kv_heads)
         current_ms_metadata = get_multistream_comm_context()
