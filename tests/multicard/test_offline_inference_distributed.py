@@ -23,7 +23,6 @@ Run `pytest tests/test_offline_inference.py`.
 import os
 from unittest.mock import patch
 
-import pytest
 from modelscope import snapshot_download  # type: ignore
 from vllm import SamplingParams
 from vllm.model_executor.models.registry import ModelRegistry
