@@ -1335,6 +1335,7 @@ class NPUModelRunner(NPUModelRunnerBase[ModelInputForNPUWithSamplingMetadata]):
                     model_input.attn_metadata.input_positions = model_input.input_positions
                 if model_input.inputs_embeds is not None:
                     logger.info(f"before execute model, the embedding size is: {model_input.inputs_embeds.size()}")
+                    logger.info(f"for now the allocated memory is {torch.npu.memory_allocated() / 1024**3} GB, reserved memory is: {torch.npu.memory_reserved() / 1024**3} GB")
                 hidden_or_intermediate_states = model_executable(
                     input_ids=model_input.input_tokens,
                     **{
