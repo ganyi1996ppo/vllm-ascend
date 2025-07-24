@@ -143,9 +143,6 @@ class AscendMLAMetadata:
     # For logging.
     num_input_tokens: int = 0  # Number of tokens including padding.
 
-    max_num_tokens_across_dp: int = 0
-    with_prefill_across_dp: bool = False
-
     query_lens: Optional[list[int]] = None
     # The dimension of the attention heads
     head_dim: Optional[int] = None
@@ -319,8 +316,8 @@ class AscendMLAMetadataBuilder:
 
         return graph_block_tables[:num_seqs, :max_blocks]
 
-    def build_dummy(self, num_reqs: int,
-                    num_actual_tokens: int) -> AscendMLAMetadata:
+    def build_torchair_graph_dummy(
+            self, num_reqs: int, num_actual_tokens: int) -> AscendMLAMetadata:
         device = self.runner.device
         _, max_blocks = self.runner.graph_block_tables.shape
         block_table = torch.zeros((num_reqs, max_blocks),
@@ -372,8 +369,7 @@ class AscendMLAMetadataBuilder:
         common_attn_metadata: CommonAttentionMetadata,
         common_prefix_len: Optional[int] = None,
         graph_pad_size: int = -1,
-        max_num_tokens_across_dp: int = 0,
-        with_prefill_across_dp: bool = False,
+        query_start_loc: torch.Tensor = None,
     ) -> AscendMLAMetadata:
         assert self._num_decodes + self._num_prefills == num_reqs
 
@@ -518,8 +514,6 @@ class AscendMLAMetadataBuilder:
             query_start_loc=query_start_loc,
             block_tables=block_table,
             seq_lens=seq_lens,
-            max_num_tokens_across_dp=max_num_tokens_across_dp,
-            with_prefill_across_dp=with_prefill_across_dp,
         )
 
 
@@ -858,7 +852,7 @@ class AscendMLAImpl(MLAAttentionImpl):
                 AscendAttentionState.ChunkedPrefill,
                 AscendAttentionState.SpecDecoding,
                 AscendAttentionState.PrefillCacheHit
-        ] and not ascend_config.chunked_prefill_for_mla:
+        ] and not self.ascend_config.chunked_prefill_for_mla:
             attn_output = attn_output_torch
 
         current_ms_metadata = get_multistream_comm_context()

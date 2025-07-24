@@ -129,10 +129,6 @@ class AscendTorchairMetadata:
     query_start_loc: torch.Tensor
     query_lens: torch.Tensor
     seq_lens: torch.Tensor
-
-    # max value of number of tokens across dp group
-    max_num_tokens_across_dp: int = 0
-
     # Maximum query length in the batch. None for decoding.
     max_query_len: Optional[int] = None
     # (num_tokens,). The indices of the token slots that input tokens will be
@@ -151,8 +147,6 @@ class AscendTorchairMetadata:
 
     # For logging.
     num_input_tokens: int = 0  # Number of tokens including padding.
-
-    with_prefill_across_dp: bool = False
 
     decode: Optional[AscendDecodeMetadata] = None
 
@@ -192,8 +186,9 @@ class AscendAttentionTorchairMetadataBuilder:
 
         return graph_block_tables[:num_seqs, :max_blocks]
 
-    def build_dummy(self, num_reqs: int,
-                    num_actual_tokens: int) -> AscendTorchairMetadata:
+    def build_torchair_graph_dummy(
+            self, num_reqs: int,
+            num_actual_tokens: int) -> AscendTorchairMetadata:
         device = self.runner.device
         _, max_blocks = self.runner.graph_block_tables.shape
         block_table = torch.zeros((num_reqs, max_blocks),
@@ -228,7 +223,6 @@ class AscendAttentionTorchairMetadataBuilder:
             seq_lens=seq_lens,
             slot_mapping=slot_mapping,
             attn_state=AscendAttentionState.DecodeOnly,
-            max_num_tokens_across_dp=num_reqs,
             decode=decode_metadata)
         return attn_metadata
 
@@ -237,9 +231,7 @@ class AscendAttentionTorchairMetadataBuilder:
               num_actual_tokens,
               max_query_len,
               common_prefix_len,
-              graph_pad_size: int = -1,
-              max_num_tokens_across_dp: int = 0,
-              with_prefill_across_dp: bool = False):
+              graph_pad_size: int = -1):
 
         device = self.runner.device
 
@@ -278,7 +270,6 @@ class AscendAttentionTorchairMetadataBuilder:
                 pad_value = 1
                 padded_seq_lens = seq_lens.tolist() + [pad_value
                                                        ] * graph_pad_size
-                max_num_tokens_across_dp = len(padded_seq_lens)
 
                 seq_lens = torch.from_numpy(
                     np.array(padded_seq_lens).astype(np.int32))
@@ -318,9 +309,7 @@ class AscendAttentionTorchairMetadataBuilder:
             max_query_len=max_query_len,
             slot_mapping=slot_mapping,
             attn_mask=attn_mask,
-            attn_state=attn_state,
-            max_num_tokens_across_dp=max_num_tokens_across_dp,
-            with_prefill_across_dp=with_prefill_across_dp)
+            attn_state=attn_state)
         return attn_metadata
 
 
